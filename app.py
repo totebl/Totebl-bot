@@ -5304,9 +5304,9 @@ def telegram_polling():
                                     send_telegram("⚠️ الصيغة غير صحيحة. استخدم: `تعيين أوزان الأطر 30 60 10` (المجموع يجب أن يساوي 100)")
                                     continue
                                 try:
-                                    w5 = float(parts[1])
-                                    w15 = float(parts[2])
-                                    w1h = float(parts[3])
+                                    w5 = float(parts[-1])
+                                    w15 = float(parts[-2])
+                                    w1h = float(parts[-3])
                                 except ValueError:
                                     send_telegram("⚠️ القيم يجب أن تكون أرقاماً. استخدم: `تعيين أوزان الأطر 30 60 10`")
                                     continue
