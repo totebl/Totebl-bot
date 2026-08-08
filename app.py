@@ -1,10 +1,15 @@
 # ========================================================================
 # بوت التداول v28.0 – النسخة النهائية مع النماذج غير الخطية والتوصيات الذكية
 # التغييرات الجوهرية:
-#   - إصلاح النماذج الثلاثة (Rule, EMR, VWAP_OBV) بعلاقات غير خطية وعقوبات قاسية
-#   - إضافة محرك التوصيات الذكي المعتمد على آخر 100 صفقة ومعامل الارتباط
-#   - أمر تلغرام جديد: "توصية بالأوزان" لاقتراح الأوزان المثلى للنماذج والأطر
-#   - الحفاظ على جميع الأسماء والواجهات القديمة لضمان التوافقية
+#   - إعادة بناء النماذج الثلاثة (Rule, EMR, VWAP_OBV) بمنطق سيكولوجي:
+#     * Rule: قوة الشموع الصاعدة + الاختراق + الزخم (ثوابت واضحة)
+#     * EMR: الخوف من التصحيح (عقوبات RSI، التباعد، ضعف الحجم)
+#     * VWAP_OBV: الجشع في مواصلة الربح (انحراف VWAP، زخم OBV، اختراق الحجم)
+#   - إضافة فلتر النموذج الواحد (يحل محل جمع Rule+EMR) مع تحكم كامل:
+#     * اختيار النموذج (rule, emr, cfhm, timing, vwap_obv)
+#     * اختيار الإطار الزمني (5m, 15m, 1h)
+#     * تحديد عتبة واحدة (مثلاً 0.60)
+#     * أوامر تلغرام للتحكم: "تعيين نموذج الفلتر", "تعيين عتبة نموذج الفلتر", "تعيين إطار نموذج الفلتر"
 #   - تحسين RateLimiter: حد أقصى 1000، هامش أمان 50 نقطة
 #   - إضافة الأوزان الصحيحة للطلبات مع wait_if_needed قبل load_markets
 #   - بدء تشغيل بانتظار عشوائي 30-60 ثانية بدلاً من 120 ثانية
@@ -183,8 +188,8 @@ MAX_EXPOSED_PERCENT = float(os.environ.get('MAX_EXPOSED_PERCENT', 0.65))
 MAX_DAILY_LOSS_PERCENT_OF_EXPOSED = float(os.environ.get('MAX_DAILY_LOSS_PERCENT_OF_EXPOSED', 0.066))
 COOLDOWN_HOURS_LOSS_LIMIT = float(os.environ.get('COOLDOWN_HOURS_LOSS_LIMIT', 6))
 MIN_VOLUME_USD = float(os.environ.get('MIN_VOLUME_USD', 30000))
-STRENGTH_THRESHOLD = float(os.environ.get('STRENGTH_THRESHOLD', 0.25))
-SCALP_MIN_PROFIT = float(os.environ.get('SCALP_MIN_PROFIT', 0.20))
+STRENGTH_THRESHOLD = float(os.environ.get('STRENGTH_THRESHOLD', 0.70))
+SCALP_MIN_PROFIT = float(os.environ.get('SCALP_MIN_PROFIT', 0.70))
 MAX_SL_PERCENT_NORMAL = float(os.environ.get('MAX_SL_PERCENT_NORMAL', 0.029))
 MAX_SL_PERCENT_MEME = float(os.environ.get('MAX_SL_PERCENT_MEME', 0.066))
 SCAN_INTERVAL_MINUTES = int(os.environ.get('SCAN_INTERVAL_MINUTES', 8))
@@ -319,11 +324,12 @@ FILTER_30D_DAYS = int(os.environ.get('FILTER_30D_DAYS', 30))                    
 _30d_performance_cache = {}
 _30d_cache_lock = threading.Lock()
 
-# ========== عتبة مجموع النموذجين (Rule+EMR) - نطاق ==========
-RULE_EMR_SUM_UPPER = float(os.environ.get('RULE_EMR_SUM_UPPER', 1.9))   # الحد الأعلى
-RULE_EMR_SUM_LOWER = float(os.environ.get('RULE_EMR_SUM_LOWER', 1.3))   # الحد الأدنى
-RULE_EMR_SUM_FILTER_ENABLED = True   # تشغيل/إيقاف الفلتر
-# =============================================================
+# ========== فلتر النموذج الواحد (جديد - يحل محل جمع Rule+EMR) ==========
+SINGLE_MODEL_FILTER_MODEL = os.environ.get('SINGLE_MODEL_FILTER_MODEL', 'rule')          # النموذج المختار: rule, emr, cfhm, timing, vwap_obv
+SINGLE_MODEL_FILTER_THRESHOLD = float(os.environ.get('SINGLE_MODEL_FILTER_THRESHOLD', 0.60))  # العتبة المطلوبة
+SINGLE_MODEL_FILTER_TIMEFRAME = os.environ.get('SINGLE_MODEL_FILTER_TIMEFRAME', '15m')     # الإطار الزمني: 5m, 15m, 1h
+SINGLE_MODEL_FILTER_ENABLED = os.environ.get('SINGLE_MODEL_FILTER_ENABLED', 'true').lower() == 'true'  # تشغيل/إيقاف
+# =====================================================================
 
 # ========== التحكم في تحديث الوقف المسبق الحقيقي (يُرسل إلى Binance) ==========
 PREEMPTIVE_SL_UPDATE_ENABLED = True   # تشغيل/إيقاف تحديث الوقف المسبق الحقيقي
@@ -2195,249 +2201,175 @@ def sync_preemptive_stop_orders_once():
     except Exception as e:
         logger.warning(f"فشل المزامنة الأولية: {e}")
 
-# ======================= نموذج VWAP + OBV (العضو المصوت الخامس) - إصلاح جذري بالعلاقات غير الخطية =======================
+# ======================================================================
+# ======================= النماذج الثلاثة المطورة (جديد) ===============
+# ======================================================================
+
+# ======================= النموذج الأول: قوة الشموع الصاعدة (الثوابت) =======================
+class AdvancedRuleModel:
+    """
+    نموذج متقدم يحل محل النموذج القاعدي (Rule).
+    يعتمد على:
+    1. قوة الشمعة الحالية (جسم كبير، ظلال قصيرة) - وزن 50%
+    2. اختراق القمة السابقة - وزن 30%
+    3. الزخم اللحظي - وزن 20%
+    """
+    def __init__(self):
+        pass
+
+    def get_signal_percent(self, df):
+        if len(df) < 20:
+            return 0.5, 0.5
+        
+        try:
+            # 1. قوة الشمعة الحالية (Bullish Candle Power)
+            open_p = df['open'].iloc[-1]
+            close_p = df['close'].iloc[-1]
+            high_p = df['high'].iloc[-1]
+            low_p = df['low'].iloc[-1]
+            
+            body = abs(close_p - open_p)
+            range_p = high_p - low_p if high_p - low_p > 0 else 1e-6
+            body_ratio = body / range_p  # 0 إلى 1
+            
+            # شمعة صاعدة قوية (جسمها > 50% من النطاق، وإغلاقها أعلى من الفتح)
+            if close_p > open_p and body_ratio > 0.5:
+                candle_score = 0.6 + (body_ratio - 0.5) * 0.8  # 0.6 إلى 1.0
+            elif close_p > open_p and body_ratio > 0.3:
+                candle_score = 0.4 + (body_ratio - 0.3) * 0.6
+            else:
+                candle_score = 0.2
+
+            # 2. اختراق القمة السابقة (آخر 10 شموع)
+            recent_high = df['high'].iloc[-10:-1].max()
+            if close_p > recent_high:
+                breakout_score = 0.9
+            elif close_p > recent_high * 0.99:
+                breakout_score = 0.6
+            else:
+                breakout_score = 0.3
+
+            # 3. الزخم اللحظي (آخر 3 شموع)
+            mom_3 = (df['close'].iloc[-1] - df['close'].iloc[-4]) / (df['close'].iloc[-4] + 1e-6)
+            if mom_3 > 0.01:
+                mom_score = min(1.0, 0.5 + mom_3 * 20)
+            else:
+                mom_score = 0.2
+
+            # التجميع النهائي (ثوابت)
+            buy_score = (candle_score * 0.5) + (breakout_score * 0.3) + (mom_score * 0.2)
+            buy_score = max(0.0, min(1.0, buy_score))
+            sell_score = max(0.0, min(1.0, 1.0 - buy_score + 0.05))
+            
+            return buy_score, sell_score
+        except Exception:
+            return 0.5, 0.5
+
+# ======================= النموذج الثاني: الخوف من التصحيح =======================
+class AdvancedMomentumFlowModel:
+    """
+    نموذج متقدم للزخم والتدفق المالي (بديل EMR).
+    يعتمد على منطق الخوف من التصحيح:
+    1. عقوبة RSI المرتفع (ذروة شراء) - وزن 40%
+    2. عقوبة التباعد عن المتوسط - وزن 30%
+    3. عقوبة ضعف الحجم مع الارتفاع - وزن 30%
+    """
+    def __init__(self):
+        pass
+
+    def update(self, symbol, df):
+        if len(df) < 30:
+            return {'buy': 0.5, 'sell': 0.5}
+
+        try:
+            close = df['close'].iloc[-1]
+            rsi = df['rsi'].iloc[-1] if 'rsi' in df else 50
+            vol_ratio = df['volume_ratio'].iloc[-1] if 'volume_ratio' in df else 1.0
+            
+            # 1. ذروة الشراء (الخوف من القمة)
+            if rsi > 75:
+                fear_overbought = 0.1  # خوف شديد
+            elif rsi > 65:
+                fear_overbought = 0.3
+            else:
+                fear_overbought = 0.7
+
+            # 2. تباعد السعر عن المتوسط قصير المدى (الانحراف)
+            ema9 = df['ema_9'].iloc[-1] if 'ema_9' in df else close
+            deviation = (close - ema9) / (ema9 + 1e-6)
+            if deviation > 0.02:
+                fear_deviation = 0.2  # السعر بعيد جداً عن المتوسط (خوف)
+            elif deviation > 0.01:
+                fear_deviation = 0.5
+            else:
+                fear_deviation = 0.8
+
+            # 3. الحجم يخبرنا بالخوف (ارتفاع السعر بحجم أقل = ضعف)
+            if vol_ratio < 0.8 and deviation > 0.01:
+                fear_volume = 0.3  # ارتفاع وهمي
+            else:
+                fear_volume = 0.8
+
+            # حساب درجة الشراء = 1 - درجة الخوف
+            buy_score = (fear_overbought * 0.4) + (fear_deviation * 0.3) + (fear_volume * 0.3)
+            buy_score = max(0.0, min(1.0, buy_score))
+            sell_score = max(0.0, min(1.0, 1.0 - buy_score + 0.05))
+            
+            return {'buy': buy_score, 'sell': sell_score}
+        except Exception:
+            return {'buy': 0.5, 'sell': 0.5}
+
+# ======================= النموذج الخامس: الجشع لمواصلة الربح =======================
 class VWAP_OBV_Model:
     """
-    نموذج لتقييم جودة الدخول بناءً على:
-    1. انحراف السعر عن خط الانحدار لـ VWAP (توقع الارتداد)
-    2. منطق عقابي قاسي عند القمم
+    نموذج VWAP + OBV (العضو المصوت الخامس).
+    يعتمد على منطق الجشع لمواصلة الربح:
+    1. انحراف السعر عن VWAP (الجشع في الارتفاع) - وزن 50%
+    2. زخم OBV (خط اتجاه الحجم) - وزن 30%
+    3. اختراق الحجم (طمع المتداولين) - وزن 20%
     """
     def get_score(self, df):
         if len(df) < 15:
             return 0.5
+
         try:
-            # 1. احسب خط الانحدار الخطي لـ VWAP خلال آخر 10 شموع
-            x = np.arange(10)
-            y = df['vwap'].iloc[-10:].values
-            if len(y) < 10 or np.std(y) == 0:
-                return 0.5
-            slope, intercept = np.polyfit(x, y, 1)
-            # 2. القيمة المتوقعة لـ VWAP في الشمعة الحالية (من الانحدار)
-            vwap_pred = slope * 9 + intercept
+            # 1. الانحراف عن VWAP (الجشع في الارتفاع)
+            vwap = df['vwap'].iloc[-1] if 'vwap' in df else df['close'].iloc[-1]
             current_price = df['close'].iloc[-1]
-            # 3. الانحراف (مقيساً بـ ATR%)
-            atr_pct = df['atr_percent'].iloc[-1] if 'atr_percent' in df else 0.02
-            if atr_pct <= 0:
-                atr_pct = 0.02
-            deviation = (current_price - vwap_pred) / (atr_pct * current_price + 1e-9)
+            vwap_ratio = current_price / vwap if vwap > 0 else 1.0
             
-            # 4. المنطق العقابي (غير الخطي)
-            if deviation > 2.0:
-                return 0.05   # قمة وشيكة (رفض قاطع)
-            elif deviation > 1.0:
-                return 0.15   # منطقة خطر
-            elif deviation < -2.0:
-                return 0.95   # قاع عميق (ارتداد متوقع)
-            elif deviation < -1.0:
-                return 0.85   # منطقة شراء جيدة
+            if vwap_ratio > 1.03:
+                greed_vwap = 0.9  # قوي جداً
+            elif vwap_ratio > 1.01:
+                greed_vwap = 0.7
             else:
-                # في المنطقة الوسطى، نعتمد على زخم السعر
-                mom_5 = (df['close'].iloc[-1] - df['close'].iloc[-6]) / (df['close'].iloc[-6] + 1e-9)
-                if mom_5 > 0.01:
-                    return min(1.0, 0.6 + mom_5 * 10)
+                greed_vwap = 0.4
+
+            # 2. زخم OBV (خط اتجاه الحجم)
+            if 'obv_trend' in df.columns and not pd.isna(df['obv_trend'].iloc[-1]):
+                obv_momentum = df['obv_trend'].iloc[-1]
+                if obv_momentum > 0:
+                    greed_obv = min(1.0, 0.6 + obv_momentum / 100000)  # تطبيع
                 else:
-                    return 0.45
+                    greed_obv = 0.3
+            else:
+                greed_obv = 0.5
+
+            # 3. اختراق الحجم (طمع المتداولين)
+            vol_ratio = df['volume_ratio'].iloc[-1] if 'volume_ratio' in df else 1.0
+            if vol_ratio > 1.8:
+                greed_volume = 0.9
+            elif vol_ratio > 1.2:
+                greed_volume = 0.7
+            else:
+                greed_volume = 0.4
+
+            # التجميع النهائي (ثوابت الجشع)
+            buy_score = (greed_vwap * 0.5) + (greed_obv * 0.3) + (greed_volume * 0.2)
+            buy_score = max(0.0, min(1.0, buy_score))
+            return buy_score
         except Exception:
             return 0.5
-
-# ======================= النموذج المتقدم الأول (القاعدة + أنماط الشموع + التباعد) - إصلاح جذري بالعلاقات غير الخطية =======================
-class AdvancedRuleModel:
-    """
-    نموذج متقدم يحل محل النموذج القاعدي (Rule).
-    يجمع بين: القاعدة الكلاسيكية + التربيع + التسارع + عقوبات قاسية عند القمم.
-    """
-    def __init__(self):
-        pass
-
-    def _detect_divergence(self, df):
-        """كشف تباعد بسيط بين السعر و RSI (آخر 20 شمعة)"""
-        if len(df) < 20:
-            return 0.0, 0.0
-        # قاعين متتاليين
-        price_lows = df['low'].iloc[-10:].values
-        rsi_vals = df['rsi'].iloc[-10:].values
-        # تباعد إيجابي: قاع سعر أقل لكن قاع RSI أعلى
-        if len(price_lows) > 2 and len(rsi_vals) > 2:
-            if price_lows[-1] < price_lows[-2] and rsi_vals[-1] > rsi_vals[-2]:
-                return 0.2, 0.0  # إشارة شراء
-            if price_lows[-1] > price_lows[-2] and rsi_vals[-1] < rsi_vals[-2]:
-                return 0.0, 0.2  # إشارة بيع
-        return 0.0, 0.0
-
-    def _candle_patterns(self, df):
-        """كشف نماذج بسيطة"""
-        if len(df) < 3:
-            return 0, 0
-        o, h, l, c = df['open'].iloc[-1], df['high'].iloc[-1], df['low'].iloc[-1], df['close'].iloc[-1]
-        o_prev, c_prev = df['open'].iloc[-2], df['close'].iloc[-2]
-        body = abs(c - o)
-        # مطرقة (Hammer) - جسم صغير وذيل سفلي طويل
-        if body > 0 and (min(o, c) - l) > body * 2 and (h - max(o, c)) < body * 0.3:
-            return 0.15, 0.0
-        # ابتلاع صاعد
-        if c > o and c_prev < o_prev and c > o_prev and o < c_prev:
-            return 0.15, 0.0
-        # ابتلاع هابط
-        if c < o and c_prev > o_prev and c < o_prev and o > c_prev:
-            return 0.0, 0.15
-        return 0.0, 0.0
-
-    def get_signal_percent(self, df):
-        """
-        تعيد (buy_score, sell_score) بين 0 و 1.
-        تستخدم التربيع، التسارع، والعقوبات القاسية.
-        """
-        if len(df) < 30:
-            return 0.5, 0.5
-
-        try:
-            close = df['close'].iloc[-1]
-            ema9 = df['ema_9'].iloc[-1] if 'ema_9' in df else close
-            ema50 = df['ema_50'].iloc[-1] if 'ema_50' in df else close
-            rsi = df['rsi'].iloc[-1] if 'rsi' in df else 50
-            adx = df['adx'].iloc[-1] if 'adx' in df else 20
-            atr = df['atr'].iloc[-1] if 'atr' in df else close * 0.02
-
-            # 1. قوة الاتجاه الحقيقية (المسافة بين EMA9 و EMA50 مقسومة على ATR)
-            trend_strength = (ema9 - ema50) / (atr + 1e-9)
-            raw_bull = max(0, min(1, (trend_strength / 2.0)))
-            # 2. تحويل غير خطي (تربيعي): يضخم الإشارات القوية ويكبت الضعيفة
-            bull_score = raw_bull ** 2
-
-            # 3. التنبؤ بالتسارع (المشتق الثاني للسعر خلال آخر 5 شموع)
-            prices = df['close'].iloc[-5:].values
-            x = np.arange(5)
-            coeffs = np.polyfit(x, prices, 2)
-            acceleration = coeffs[0] * 2
-            if acceleration > 0 and (prices[-1] - prices[0]) > 0:
-                accel_bonus = 0.15 * min(1, acceleration / 0.001)
-            else:
-                accel_bonus = 0.0
-            if acceleration < -0.0005 and (prices[-1] - prices[0]) > 0:
-                accel_penalty = 0.2
-            else:
-                accel_penalty = 0.0
-
-            # 4. العقوبات القاسية (غير الخطية) لتجنب القمم
-            if rsi > 70 and (close / ema9 - 1) > 0.01:
-                bull_score = bull_score * 0.1  # رفض قاطع
-            elif rsi > 60 and (close / ema9 - 1) < 0.005:
-                bull_score = bull_score * 0.5  # تخفيض 50%
-
-            # 5. مكافأة غير خطية للقيعان الحادة
-            if rsi < 30 and (close / ema9 - 1) < -0.02:
-                bull_score = min(1.0, bull_score + 0.3)  # دفعة قوية
-
-            # 6. دمج التسارع والعقوبات
-            bull_score = bull_score + accel_bonus - accel_penalty
-            bull_score = max(0, min(1, bull_score))
-            sell_score = max(0, min(1, 1 - bull_score - 0.05))
-            return bull_score, sell_score
-        except Exception:
-            return 0.5, 0.5
-
-# ======================= النموذج المتقدم الثاني (الزخم والتدفق المالي) - إصلاح جذري بالعلاقات غير الخطية =======================
-class AdvancedMomentumFlowModel:
-    """
-    نموذج متقدم للزخم والتدفق المالي (بديل EMR) مع منطق قطعي حاد وتنبؤ بتشبع OBV.
-    """
-    def __init__(self):
-        pass
-
-    def _detect_obv_divergence(self, df):
-        if len(df) < 20 or 'obv' not in df.columns:
-            return 0.0, 0.0
-        price_lows = df['low'].iloc[-10:].values
-        obv_vals = df['obv'].iloc[-10:].values
-        if len(price_lows) < 3 or len(obv_vals) < 3:
-            return 0.0, 0.0
-        if (price_lows[-1] < price_lows[-2] and price_lows[-2] < price_lows[-3]) and \
-           (obv_vals[-1] > obv_vals[-2] and obv_vals[-2] > obv_vals[-3]):
-            return 0.2, 0.0
-        if (price_lows[-1] > price_lows[-2] and price_lows[-2] > price_lows[-3]) and \
-           (obv_vals[-1] < obv_vals[-2] and obv_vals[-2] < obv_vals[-3]):
-            return 0.0, 0.2
-        return 0.0, 0.0
-
-    def update(self, symbol, df):
-        """
-        تعيد قاموساً يحتوي على {'buy': float, 'sell': float}
-        تستخدم منطقاً قطعياً حاداً بدلاً من Sigmoid، وتضيف تنبؤ تشبع OBV.
-        """
-        if len(df) < 30:
-            return {'buy': 0.5, 'sell': 0.5}
-
-        try:
-            close = df['close'].iloc[-1]
-            atr_pct = df['atr_percent'].iloc[-1] if 'atr_percent' in df else 0.02
-            rsi = df['rsi'].iloc[-1] if 'rsi' in df else 50
-            adx = df['adx'].iloc[-1] if 'adx' in df else 20
-            mfi = df['mfi'].iloc[-1] if 'mfi' in df else 50
-            obv_trend = df['obv_trend'].iloc[-1] if 'obv_trend' in df else 0
-            vol_ratio = df['volume_ratio'].iloc[-1] if 'volume_ratio' in df else 1.0
-
-            # 1. الزخم المُكيَّف مع ATR + التسارع (منطق قطعي حاد)
-            if len(df) >= 11:
-                mom5 = (df['close'].iloc[-1] - df['close'].iloc[-6]) / (df['close'].iloc[-6] + 1e-9)
-                mom10 = (df['close'].iloc[-1] - df['close'].iloc[-11]) / (df['close'].iloc[-11] + 1e-9)
-                adj_mom = (mom5 * 0.6 + mom10 * 0.4) / (atr_pct + 0.001)
-            else:
-                adj_mom = 0
-
-            # تحويل حاد (Cut-off) بدلاً من Sigmoid
-            if adj_mom > 2.0:
-                mom_score = 0.95
-            elif adj_mom < -2.0:
-                mom_score = 0.05
-            else:
-                mom_score = 0.5 + adj_mom * 0.4
-            mom_score = max(0.0, min(1.0, mom_score))
-
-            # 2. عقوبة إذا كانت آخر شمعة سلبية رغم الزخم الإيجابي
-            last_candle_mom = (df['close'].iloc[-1] - df['close'].iloc[-2]) / (df['close'].iloc[-2] + 1e-9)
-            if last_candle_mom < -0.005 and mom_score > 0.5:
-                mom_score = mom_score * 0.5  # تخفيض 50%
-
-            # 3. مكافأة غير خطية للاختراق المفاجئ للحجم
-            if vol_ratio > 2.0 and mom_score > 0.3:
-                mom_score = min(1.0, mom_score + 0.2)
-
-            # 4. تنبؤ تشبع OBV (الانحراف المعياري)
-            obv_penalty = 0.0
-            if 'obv' in df and len(df) >= 5:
-                obv_std = np.std(df['obv'].iloc[-5:])
-                obv_mean = np.mean(df['obv'].iloc[-5:])
-                current_obv = df['obv'].iloc[-1]
-                if obv_std > 0 and abs(current_obv - obv_mean) > 2 * obv_std:
-                    if current_obv > obv_mean:
-                        obv_penalty = 0.25   # تشبع شرائي
-                    else:
-                        obv_penalty = -0.15  # تشبع بيعي (قد يرتد)
-
-            # 5. MFI و RSI (مقاربة سريعة)
-            if mfi < 20:
-                mfi_score = 0.8
-            elif mfi < 40:
-                mfi_score = 0.6 + (mfi - 20) / 100
-            elif mfi < 60:
-                mfi_score = 0.5
-            elif mfi < 80:
-                mfi_score = 0.4 - (mfi - 60) / 100
-            else:
-                mfi_score = 0.1
-
-            # 6. OBV الأساسي
-            obv_score = 0.0
-            if obv_trend > 0:
-                obv_score = 0.15
-            # 7. الدمج النهائي
-            buy_score = (mom_score * 0.4) + (mfi_score * 0.3) + (0.5 + obv_score) * 0.3
-            buy_score = buy_score - obv_penalty
-            buy_score = max(0.0, min(1.0, buy_score))
-            sell_score = max(0.0, min(1.0, 1.0 - buy_score + 0.05))
-            return {'buy': buy_score, 'sell': sell_score}
-        except Exception:
-            return {'buy': 0.5, 'sell': 0.5}
 
 # --------------------------- باقي النماذج (بدون تغيير) ---------------------------
 class CFHMModel:
@@ -2561,7 +2493,7 @@ class MomentumDecayModel:
                 return 0.2 + time_factor
         return 0.0
 
-# ======================= نموذج توقيت الدخول (بدون تغيير لأنه ناجح بالفعل) =======================
+# ======================= نموذج توقيت الدخول (بدون تغيير) =======================
 class EntryTimingModel:
     """
     نموذج لتقييم توقيت الدخول: هل نحن في بداية ارتفاع أم في قمة مؤقتة؟
@@ -2654,11 +2586,11 @@ def get_multiplier_from_score(score_5m):
 class BuyingCommittee:
     def __init__(self):
         self.models = {
-            'rule': AdvancedRuleModel(),                    # النموذج المتقدم الأول (القاعدة + أنماط الشموع + التباعد)
-            'emr': AdvancedMomentumFlowModel(),             # النموذج المتقدم الثاني (الزخم والتدفق المالي)
+            'rule': AdvancedRuleModel(),                    # النموذج المتقدم الأول (قوة الشموع الصاعدة)
+            'emr': AdvancedMomentumFlowModel(),             # النموذج المتقدم الثاني (الخوف من التصحيح)
             'cfhm': CFHMModel(),
-            'timing': EntryTimingModel(),      # العضو المصوت الرابع
-            'vwap_obv': VWAP_OBV_Model()       # العضو المصوت الخامس (جديد)
+            'timing': EntryTimingModel(),                  # العضو المصوت الرابع
+            'vwap_obv': VWAP_OBV_Model()                   # العضو المصوت الخامس (الجشع لمواصلة الربح)
         }
         # ======================== تم تحديث الأوزان الافتراضية إلى النسب النهائية ========================
         self.weights = {
@@ -2754,7 +2686,11 @@ class BuyingCommittee:
             ) / 100.0
         # ======================== استخدام الأوزان النهائية ========================
         weighted_avg = sum(avg_scores[m] * self.weights[m] for m in self.weights)
-        rule_emr_sum = avg_scores['rule'] + avg_scores['emr']
+        
+        # ===== الفلتر الجديد (نموذج واحد + إطار محدد + عتبة) =====
+        # نحسب rule_emr_sum هنا فقط لتوافق الدالة القديمة، لكننا نستخدم المتغيرات الجديدة
+        rule_emr_sum = avg_scores['rule'] + avg_scores['emr']  # للتخزين فقط، لا يُستخدم في الفلتر الجديد
+        
         return {
             'avg_scores': avg_scores,
             'weighted_avg': weighted_avg,
@@ -2763,20 +2699,27 @@ class BuyingCommittee:
 
     # ===== دالة القرار الجديدة (تستقبل 3 أطر) =====
     def decide(self, df_5m, df_15m, df_1h, symbol, sym_type='normal', market_condition='normal'):
-        global RULE_EMR_SUM_UPPER, RULE_EMR_SUM_LOWER, RULE_EMR_SUM_FILTER_ENABLED
+        global SINGLE_MODEL_FILTER_MODEL, SINGLE_MODEL_FILTER_THRESHOLD, SINGLE_MODEL_FILTER_TIMEFRAME, SINGLE_MODEL_FILTER_ENABLED
         
         res = self.calculate_weighted_average(df_5m, df_15m, df_1h, symbol, sym_type, market_condition)
         avg_scores = res['avg_scores']
         avg = res['weighted_avg']
-        rule_emr_sum = res['rule_emr_sum']
 
-        # ===== التحقق من نطاق مجموع النموذجين (حد أدنى وحد أعلى) =====
-        if RULE_EMR_SUM_FILTER_ENABLED:
-            if rule_emr_sum > RULE_EMR_SUM_UPPER:
-                reason = f"❌ رفض: مجموع (Rule+EMR) = {rule_emr_sum:.2f} > الحد الأعلى {RULE_EMR_SUM_UPPER:.2f}"
-                return 'neutral', 0, 0, reason, avg_scores
-            if rule_emr_sum < RULE_EMR_SUM_LOWER:
-                reason = f"❌ رفض: مجموع (Rule+EMR) = {rule_emr_sum:.2f} < الحد الأدنى {RULE_EMR_SUM_LOWER:.2f}"
+        # ===== فلتر النموذج الواحد الجديد =====
+        if SINGLE_MODEL_FILTER_ENABLED:
+            # اختيار الإطار المطلوب
+            if SINGLE_MODEL_FILTER_TIMEFRAME == '5m':
+                scores = self._get_scores(df_5m)
+            elif SINGLE_MODEL_FILTER_TIMEFRAME == '1h':
+                scores = self._get_scores(df_1h)
+            else:  # 15m
+                scores = self._get_scores(df_15m)
+            
+            # الحصول على درجة النموذج المختار من الإطار المحدد
+            selected_score = scores.get(SINGLE_MODEL_FILTER_MODEL, 0.5)
+            
+            if selected_score < SINGLE_MODEL_FILTER_THRESHOLD:
+                reason = f"❌ رفض: {SINGLE_MODEL_FILTER_MODEL} ({SINGLE_MODEL_FILTER_TIMEFRAME}) = {selected_score:.3f} < {SINGLE_MODEL_FILTER_THRESHOLD:.2f}"
                 return 'neutral', 0, 0, reason, avg_scores
 
         cfg = self.thresholds.get(sym_type, {}).get(market_condition, self.thresholds['normal']['normal'])
@@ -4531,7 +4474,6 @@ def periodic_status_report():
 
 # --------------------------- دالة telegram_polling المعدلة (مع إضافة الأوامر الجديدة) ---------------------------
 def telegram_polling():
-    global RULE_EMR_SUM_UPPER, RULE_EMR_SUM_LOWER, RULE_EMR_SUM_FILTER_ENABLED
     global _last_telegram_update_id
     global FILTER_MANIPULATION_ENABLED, FILTER_LIQUIDITY_ENABLED, FILTER_MARKET_CAP_ENABLED
     global FILTER_VOLUME_24H_ENABLED, FILTER_CHANGE_24H_ENABLED, FILTER_HOUR_CANDLE_ENABLED
@@ -4555,6 +4497,8 @@ def telegram_polling():
     global TRAILING_DISTANCE_PERCENT, SELL_15M_THRESHOLD
     global PAUSE_ANALYSIS
     global WEIGHT_5M, WEIGHT_15M, WEIGHT_1H
+    # ===== المتغيرات الجديدة للفلتر =====
+    global SINGLE_MODEL_FILTER_MODEL, SINGLE_MODEL_FILTER_THRESHOLD, SINGLE_MODEL_FILTER_TIMEFRAME, SINGLE_MODEL_FILTER_ENABLED
 
     logger.info("✅ بدء تشغيل مراقبة تلغرام...")
     load_telegram_last_id()
@@ -4724,10 +4668,11 @@ def telegram_polling():
                                           f"⏳ <b>نظام التبريد الذكي:</b>\n"
                                           f"   ✅ تبريد الصفقة الرابحة: {COOLDOWN_WIN_HOURS:.1f} ساعة\n"
                                           f"   🔴 تبريد الصفقة الخاسرة: {COOLDOWN_LOSS_MINUTES:.0f} دقائق\n"
-                                          f"🎯 <b>عتبات مجموع النموذجين (Rule+EMR):</b>\n"
-                                          f"   - الحد الأعلى: {RULE_EMR_SUM_UPPER:.2f}\n"
-                                          f"   - الحد الأدنى: {RULE_EMR_SUM_LOWER:.2f}\n"
-                                          f"   - حالة الفلتر: {'✅ مفعل' if RULE_EMR_SUM_FILTER_ENABLED else '❌ معطل'}\n"
+                                          f"🎯 <b>فلتر النموذج الواحد (جديد):</b>\n"
+                                          f"   - النموذج المختار: {SINGLE_MODEL_FILTER_MODEL}\n"
+                                          f"   - العتبة: {SINGLE_MODEL_FILTER_THRESHOLD:.2f}\n"
+                                          f"   - الإطار الزمني: {SINGLE_MODEL_FILTER_TIMEFRAME}\n"
+                                          f"   - الحالة: {'✅ مفعل' if SINGLE_MODEL_FILTER_ENABLED else '❌ معطل'}\n"
                                           f"⚙️ <b>تحديث الوقف المسبق الحقيقي:</b> {'✅ مفعل' if PREEMPTIVE_SL_UPDATE_ENABLED else '❌ معطل'}\n"
                                           f"   - نسبة تفعيل الوقف: {CUSTOM_PREEMPTIVE_SL_TRIGGER:.2%}\n"
                                           f"   - حد تنفيذ الوقف: {CUSTOM_PREEMPTIVE_SL_LIMIT:.2%}")
@@ -5229,48 +5174,57 @@ def telegram_polling():
                                 send_telegram("▶️ تم تشغيل التحليل ومسح السوق.")
                             
                             # ------------------------------------------------------------
-                            # 13. أوامر عتبات النموذجين الجديدة
+                            # 13. أوامر فلتر النموذج الواحد الجديدة
                             # ------------------------------------------------------------
-                            elif text == 'عرض عتبات النموذجين' or text == 'عتبات النموذجين':
-                                status = "🟢 مفعل" if RULE_EMR_SUM_FILTER_ENABLED else "🔴 معطل"
-                                send_telegram(f"🎯 عتبات مجموع النموذجين (Rule+EMR):\n   الحد الأعلى: {RULE_EMR_SUM_UPPER:.2f}\n   الحد الأدنى: {RULE_EMR_SUM_LOWER:.2f}\nحالة الفلتر: {status}")
-
-                            elif text.startswith('تعيين الحد الأعلا لعتبة النموذجين'):
+                            elif text.startswith('تعيين نموذج الفلتر'):
+                                # استخراج النموذج المطلوب
+                                match = re.search(r'(rule|emr|cfhm|timing|vwap_obv|vwap)', text.lower())
+                                if match:
+                                    model = match.group(1)
+                                    if model == 'vwap':
+                                        model = 'vwap_obv'
+                                    if model in ['rule', 'emr', 'cfhm', 'timing', 'vwap_obv']:
+                                        SINGLE_MODEL_FILTER_MODEL = model
+                                        save_state()
+                                        send_telegram(f"✅ تم تعيين نموذج الفلتر إلى {model}")
+                                    else:
+                                        send_telegram("⚠️ النموذج غير معروف. اختر: rule, emr, cfhm, timing, vwap_obv")
+                                else:
+                                    send_telegram("⚠️ الصيغة غير صحيحة. استخدم: `تعيين نموذج الفلتر rule`")
+                            
+                            elif text.startswith('تعيين عتبة نموذج الفلتر'):
                                 match = re.search(r'(\d+(?:\.\d+)?)', text)
                                 if match:
-                                    new_val = float(match.group(1))
-                                    if 0.0 <= new_val <= 3.0:
-                                        RULE_EMR_SUM_UPPER = new_val
+                                    new_threshold = float(match.group(1))
+                                    if 0.05 <= new_threshold <= 0.95:
+                                        SINGLE_MODEL_FILTER_THRESHOLD = new_threshold
                                         save_state()
-                                        send_telegram(f"✅ تم تعيين الحد الأعلى لعتبة النموذجين إلى {new_val:.2f}")
+                                        send_telegram(f"✅ تم تعيين عتبة نموذج الفلتر إلى {new_threshold:.2f}")
                                     else:
-                                        send_telegram("⚠️ القيمة يجب أن تكون بين 0.0 و 3.0")
+                                        send_telegram("⚠️ القيمة يجب أن تكون بين 0.05 و 0.95")
                                 else:
-                                    send_telegram("⚠️ الصيغة غير صحيحة. استخدم: `تعيين الحد الأعلا لعتبة النموذجين 1.8`")
-
-                            elif text.startswith('تعيين الحد الادنا لعتبة النموذجين'):
-                                match = re.search(r'(\d+(?:\.\d+)?)', text)
+                                    send_telegram("⚠️ الصيغة غير صحيحة. استخدم: `تعيين عتبة نموذج الفلتر 0.60`")
+                            
+                            elif text.startswith('تعيين إطار نموذج الفلتر'):
+                                match = re.search(r'(5m|15m|1h)', text)
                                 if match:
-                                    new_val = float(match.group(1))
-                                    if 0.0 <= new_val <= 3.0:
-                                        RULE_EMR_SUM_LOWER = new_val
-                                        save_state()
-                                        send_telegram(f"✅ تم تعيين الحد الأدنى لعتبة النموذجين إلى {new_val:.2f}")
-                                    else:
-                                        send_telegram("⚠️ القيمة يجب أن تكون بين 0.0 و 3.0")
+                                    tf = match.group(1)
+                                    SINGLE_MODEL_FILTER_TIMEFRAME = tf
+                                    save_state()
+                                    send_telegram(f"✅ تم تعيين إطار نموذج الفلتر إلى {tf}")
                                 else:
-                                    send_telegram("⚠️ الصيغة غير صحيحة. استخدم: `تعيين الحد الادنا لعتبة النموذجين 1.2`")
-
-                            elif text == 'شغل فلتر النموذجين':
-                                RULE_EMR_SUM_FILTER_ENABLED = True
+                                    send_telegram("⚠️ الصيغة غير صحيحة. استخدم: `تعيين إطار نموذج الفلتر 15m`")
+                            
+                            elif text == 'شغل فلتر النموذج':
+                                SINGLE_MODEL_FILTER_ENABLED = True
                                 save_state()
-                                send_telegram("🟢 تم تفعيل فلتر مجموع النموذجين (سيتم رفض الصفقات خارج النطاق)")
-
-                            elif text == 'أوقف فلتر النموذجين':
-                                RULE_EMR_SUM_FILTER_ENABLED = False
+                                send_telegram(f"🟢 تم تفعيل فلتر النموذج (النموذج: {SINGLE_MODEL_FILTER_MODEL}, الإطار: {SINGLE_MODEL_FILTER_TIMEFRAME}, العتبة: {SINGLE_MODEL_FILTER_THRESHOLD:.2f})")
+                            
+                            elif text == 'أوقف فلتر النموذج':
+                                SINGLE_MODEL_FILTER_ENABLED = False
                                 save_state()
-                                send_telegram("🔴 تم إيقاف فلتر مجموع النموذجين (لن يتم تطبيق شرط النطاق)")
-
+                                send_telegram("🔴 تم إيقاف فلتر النموذج (لن يُطبق أي فلتر إضافي)")
+                            
                             # ------------------------------------------------------------
                             # 14. أوامر تحديث الوقف المسبق الحقيقي
                             # ------------------------------------------------------------
@@ -5471,10 +5425,11 @@ def telegram_polling():
                                     _symbol_cooldown_until.clear()
                                 with _30d_cache_lock:
                                     _30d_performance_cache.clear()
-                                # إعادة ضبط عتبات النموذجين
-                                RULE_EMR_SUM_UPPER = 1.9
-                                RULE_EMR_SUM_LOWER = 1.3
-                                RULE_EMR_SUM_FILTER_ENABLED = True
+                                # إعادة ضبط فلتر النموذج الواحد
+                                SINGLE_MODEL_FILTER_MODEL = 'rule'
+                                SINGLE_MODEL_FILTER_THRESHOLD = 0.60
+                                SINGLE_MODEL_FILTER_TIMEFRAME = '15m'
+                                SINGLE_MODEL_FILTER_ENABLED = True
                                 # إعادة ضبط إعدادات الوقف
                                 PREEMPTIVE_SL_UPDATE_ENABLED = True
                                 CUSTOM_PREEMPTIVE_SL_TRIGGER = PREPLACED_SL_TRIGGER_PERCENT
@@ -5493,7 +5448,7 @@ def telegram_polling():
                                 # إعادة ضبط أوزان النماذج إلى القيم النهائية
                                 buying_committee.weights = {'rule':0.10, 'emr':0.05, 'cfhm':0.10, 'timing':0.55, 'vwap_obv':0.20}
                                 SELL_WEIGHTS = {'rule':0.10, 'emr':0.05, 'cfhm':0.10, 'timing':0.55, 'vwap_obv':0.20}
-                                send_telegram("🟢 تم إعادة ضبط جميع الفلاتر والإعدادات الديناميكية إلى القيم الافتراضية (مع أوزان النماذج النهائية: 10%،5%،10%،55%،20% وأوزان الأطر 10%،30%،60% وعتبة 0.52)")
+                                send_telegram("🟢 تم إعادة ضبط جميع الفلاتر والإعدادات الديناميكية إلى القيم الافتراضية (مع فلتر النموذج الواحد: Rule على إطار 15m بعتبة 0.60)")
                                 save_state()
                             
                             # ------------------------------------------------------------
@@ -5774,9 +5729,12 @@ def save_state():
                 '30d_profit_enabled': FILTER_30D_PROFIT_ENABLED,
                 'min_30d_profit_percent': MIN_30D_PROFIT_PERCENT,
                 '30d_days': FILTER_30D_DAYS,
-                'rule_emr_sum_upper': RULE_EMR_SUM_UPPER,
-                'rule_emr_sum_lower': RULE_EMR_SUM_LOWER,
-                'rule_emr_sum_filter_enabled': RULE_EMR_SUM_FILTER_ENABLED,
+                # === فلتر النموذج الواحد (جديد) ===
+                'single_model_filter_model': SINGLE_MODEL_FILTER_MODEL,
+                'single_model_filter_threshold': SINGLE_MODEL_FILTER_THRESHOLD,
+                'single_model_filter_timeframe': SINGLE_MODEL_FILTER_TIMEFRAME,
+                'single_model_filter_enabled': SINGLE_MODEL_FILTER_ENABLED,
+                # ================================
                 'preemptive_sl_update_enabled': PREEMPTIVE_SL_UPDATE_ENABLED,
                 'preemptive_sl_trigger': CUSTOM_PREEMPTIVE_SL_TRIGGER,
                 'preemptive_sl_limit': CUSTOM_PREEMPTIVE_SL_LIMIT,
@@ -5834,11 +5792,12 @@ def load_state():
     global FILTER_30D_PROFIT_ENABLED, MIN_30D_PROFIT_PERCENT, FILTER_30D_DAYS
     global PAUSE_NEW_ENTRIES
     global COOLDOWN_WIN_HOURS, COOLDOWN_LOSS_MINUTES, _symbol_cooldown_until
-    global RULE_EMR_SUM_UPPER, RULE_EMR_SUM_LOWER, RULE_EMR_SUM_FILTER_ENABLED
     global USE_1H_MULTIPLIER
     global PREEMPTIVE_SL_UPDATE_ENABLED, CUSTOM_PREEMPTIVE_SL_TRIGGER, CUSTOM_PREEMPTIVE_SL_LIMIT
     global TRAILING_DISTANCE_PERCENT, SELL_15M_THRESHOLD
     global WEIGHT_5M, WEIGHT_15M, WEIGHT_1H
+    # === المتغيرات الجديدة للفلتر ===
+    global SINGLE_MODEL_FILTER_MODEL, SINGLE_MODEL_FILTER_THRESHOLD, SINGLE_MODEL_FILTER_TIMEFRAME, SINGLE_MODEL_FILTER_ENABLED
     # PAUSE_ANALYSIS لا نحتاج لحفظها (تكون False عند التشغيل)
 
     def _load_from_file(filepath):
@@ -5942,9 +5901,12 @@ def load_state():
         FILTER_30D_PROFIT_ENABLED = filters.get('30d_profit_enabled', False)
         MIN_30D_PROFIT_PERCENT = filters.get('min_30d_profit_percent', 0.0)
         FILTER_30D_DAYS = filters.get('30d_days', 30)
-        RULE_EMR_SUM_UPPER = filters.get('rule_emr_sum_upper', 1.9)
-        RULE_EMR_SUM_LOWER = filters.get('rule_emr_sum_lower', 1.3)
-        RULE_EMR_SUM_FILTER_ENABLED = filters.get('rule_emr_sum_filter_enabled', True)
+        # === قراءة فلتر النموذج الواحد ===
+        SINGLE_MODEL_FILTER_MODEL = filters.get('single_model_filter_model', 'rule')
+        SINGLE_MODEL_FILTER_THRESHOLD = filters.get('single_model_filter_threshold', 0.60)
+        SINGLE_MODEL_FILTER_TIMEFRAME = filters.get('single_model_filter_timeframe', '15m')
+        SINGLE_MODEL_FILTER_ENABLED = filters.get('single_model_filter_enabled', True)
+        # ================================
         PREEMPTIVE_SL_UPDATE_ENABLED = filters.get('preemptive_sl_update_enabled', True)
         CUSTOM_PREEMPTIVE_SL_TRIGGER = filters.get('preemptive_sl_trigger', PREPLACED_SL_TRIGGER_PERCENT)
         CUSTOM_PREEMPTIVE_SL_LIMIT = filters.get('preemptive_sl_limit', PREPLACED_SL_LIMIT_PERCENT)
@@ -6100,7 +6062,8 @@ if __name__ == '__main__':
                   f"✅ **تطبيق التقطيع الثلاثي للشموع (كامل، نصف، ربع) مع حساب المتوسط الحسابي للدرجات**\n"
                   f"✅ **التقطيع الديناميكي يتكيف مع أي عدد من الشموع (حد أدنى 20 شمعة)**\n"
                   f"✅ **عرض الدرجة الخامسة في رسالة الشراء مع الإشارة إلى أنها متوسط 3 نوافذ**\n"
-                  f"✅ **عتبات مجموع النموذجين (Rule+EMR) كحد أدنى وحد أعلى مع تحكم كامل عبر تلغرام**\n"
+                  f"✅ **فلتر النموذج الواحد (جديد): حل محل فلتر جمع Rule+EMR بمنطق أبسط وأقوى**\n"
+                  f"✅ **اختيار النموذج (rule, emr, cfhm, timing, vwap_obv) والعتبة والإطار عبر أوامر تلغرام**\n"
                   f"✅ **التحكم بتحديث الوقف المسبق الحقيقي (تشغيل/إيقاف، نسبة التفعيل، ونسبة التنفيذ) عبر تلغرام**\n"
                   f"✅ **مضاعف جديد مستند إلى إطار 5 دقائق مع تحكم عبر تلغرام: `شغل المضاعف` / `أوقف المضاعف`**\n"
                   f"✅ **نظام تتبع الأرباح الفوري (الوقف المتحرك) يُفعّل من اللحظة الأولى بنسبة قابلة للتعديل عبر تلغرام**\n"
